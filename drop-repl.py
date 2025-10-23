@@ -4,11 +4,13 @@
 # Python 3.9+. No hard deps; optional: rich, rapidfuzz, prompt_toolkit, fzf, pyyaml (for outflows).
 
 from __future__ import annotations
-import argparse, json, os, re, sys, hashlib, shutil, subprocess, tempfile, random, time
+import argparse, json, os, re, sys, shutil, subprocess, tempfile, random, time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone, date, timedelta
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple, Dict, Any
+from typing import Iterable, List, Optional, Tuple
+
+__version__ = "0.1.1"
 
 # ---------- Optional niceties ----------
 try:
@@ -70,35 +72,10 @@ def _to_crockford(num: int, length: int) -> str:
 
 def new_ulid() -> str:
     t_ms = int(time.time() * 1000)
-    # 48-bit time
-    time_part = _to_crockford(t_ms, 10)  # 48 bits fit into 10 base32 chars
-    # 80-bit randomness => 16 base32 chars
+    time_part = _to_crockford(t_ms, 10)
     rand_hi = random.getrandbits(80)
     rand_part = _to_crockford(rand_hi, 16)
     return time_part + rand_part  # 26 chars
-
-def _resolve_unique_id(store: "ScrapStore", token: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Resolve a user-supplied ID or prefix to a unique full id among *live* notes.
-    Returns (full_id, error_message). If error_message is not None, resolution failed.
-    """
-    token = (token or "").strip()
-    if not token:
-        return None, "no id provided"
-    # exact match wins
-    for s in store.iter_live():
-        if s.id == token:
-            return s.id, None
-    # prefix match
-    cands = [s.id for s in store.iter_live() if s.id.startswith(token)]
-    if not cands:
-        return None, f"no live note matches id/prefix '{token}'"
-    if len(cands) > 1:
-        # show 2 suggestions to help the user disambiguate
-        hints = ", ".join(c[:12] for c in cands[:2])
-        return None, f"ambiguous id/prefix '{token}' ({len(cands)} matches; try a longer prefix like: {hints})"
-    return cands[0], None
-
 
 # ---------- Model ----------
 HASHTAG_RE = re.compile(r"#([\w\-]+)")
@@ -112,7 +89,6 @@ class Scrap:
 
     @staticmethod
     def from_obj(obj: dict) -> "Scrap":
-        # normalize id to string
         rid = obj.get("id")
         if isinstance(rid, int):
             rid = str(rid)
@@ -208,7 +184,6 @@ class ScrapStore:
         return True
 
     def iter_all(self) -> Iterable[Scrap]:
-        """All non-tombstone scraps ever written (includes ones later deleted if you don't check _deleted)."""
         with self.path.open("r", encoding="utf-8") as f:
             for raw in f:
                 raw = raw.strip()
@@ -294,13 +269,16 @@ def _load_outflows() -> List[Outflow]:
             if not str(export_path):
                 sys.stderr.write(f"[warn] outflow '{name}' missing export_path; skipped.\n")
                 continue
-            # accept either elide_rule_token (new) or elide_rule_tag (legacy)
             elide = bool(item.get("elide_rule_token", item.get("elide_rule_tag", False)))
             out.append(Outflow(name=name, rule=rule, export_path=export_path, elide_rule_token=elide))
         return out
     except Exception as e:
         sys.stderr.write(f"[warn] Failed to parse outflows.yaml: {e}\n")
         return []
+
+def _contains_route_token(text: str, route: str) -> bool:
+    pattern = re.compile(rf"(?<![\w\-])@{re.escape(route)}(?![\w\-])")
+    return bool(pattern.search(text))
 
 def _matches_outflow(s: Scrap, of: Outflow) -> bool:
     r = of.rule.strip()
@@ -312,29 +290,13 @@ def _matches_outflow(s: Scrap, of: Outflow) -> bool:
     if r.startswith("@"):
         route = r[1:].lower()
         return _contains_route_token(s.text, route)
-    # bare tag fallback
     return r.lower().lstrip("#") in s.tags
 
-
-# ---- Routing (@route) + leading-only elision helpers ----
-def _contains_route_token(text: str, route: str) -> bool:
-    """
-    Does text contain '@route' as a standalone token (not inside a word)?
-    """
-    pattern = re.compile(rf"(?<![\w\-])@{re.escape(route)}(?![\w\-])")
-    return bool(pattern.search(text))
-
 def _elide_leading_tag(text: str, tag: str) -> str:
-    """
-    Remove a single leading '#tag' token (and following spaces) if present.
-    """
     pattern = re.compile(rf"^\s*#(?i:{re.escape(tag)})(?![\w\-])[ \t]*")
     return pattern.sub("", text, count=1)
 
 def _elide_leading_route(text: str, route: str) -> str:
-    """
-    Remove a single leading '@route' token (and following spaces) if present.
-    """
     pattern = re.compile(rf"^\s*@(?i:{re.escape(route)})(?![\w\-])[ \t]*")
     return pattern.sub("", text, count=1)
 
@@ -342,7 +304,6 @@ def _render_text_for_outflow(s: Scrap, of: Outflow) -> str:
     if not of.elide_rule_token:
         return s.text
     r = of.rule.strip()
-    # Only elide if rule is a token rule and matches
     if r.startswith("#"):
         tag = r[1:].lower()
         if tag in s.tags:
@@ -357,10 +318,6 @@ def _render_text_for_outflow(s: Scrap, of: Outflow) -> str:
 
 def export_daily_markdown(store: ScrapStore, out_dir: Path, days_ago: int = 0,
                           filter_fn=None, transform_fn=None) -> Path:
-    """
-    Export all live scraps from a given local calendar day to Markdown.
-    Optionally filter_fn(Scrap)->bool and transform_fn(Scrap)->str (text override).
-    """
     target_day = (date.today() - timedelta(days=days_ago)).isoformat()
     out_dir = out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -380,7 +337,7 @@ def export_daily_markdown(store: ScrapStore, out_dir: Path, days_ago: int = 0,
     out_path.write_text("\n".join(lines), encoding="utf-8")
     return out_path
 
-# ---------- Editor capture (same as before) ----------
+# ---------- Editor capture ----------
 def _resolve_editor_argv(tmp_path: Path) -> List[str]:
     cmd = _EDITOR_CMD
     if "{file}" in cmd:
@@ -454,6 +411,62 @@ def _prompt_multiline(label: str = "add> ") -> Optional[str]:
     except (EOFError, KeyboardInterrupt):
         return None
 
+# ---------- ID resolution ----------
+def _resolve_unique_id(store: "ScrapStore", token: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Resolve a user-supplied ID or prefix to a unique full id among *live* notes.
+    Returns (full_id, error_message). If error_message is not None, resolution failed.
+    """
+    token = (token or "").strip()
+    if not token:
+        return None, "no id provided"
+
+    # collect once to be able to show snippets
+    notes = list(store.iter_live())
+
+    # exact match
+    for s in notes:
+        if s.id == token:
+            return s.id, None
+
+    # prefix matches
+    cands = [s for s in notes if s.id.startswith(token)]
+    if not cands:
+        return None, f"no live note matches id/prefix '{token}'"
+    if len(cands) > 1:
+        # show up to 2 suggestions with short snippets
+        def hint(s: Scrap) -> str:
+            return f"{s.id[:12]} … {s.text[:24].replace(os.linesep, ' ')}"
+        examples = ", ".join(hint(s) for s in cands[:2])
+        return None, f"ambiguous id/prefix '{token}' ({len(cands)} matches; try a longer prefix like: {examples})"
+    return cands[0].id, None
+
+def _resolve_in_current_then_global(store: "ScrapStore", current: List[Scrap], token: str) -> Tuple[Optional[str], Optional[str], bool]:
+    """
+    Try to resolve token within current filtered set first; if not unique, fall back to global.
+    Returns (full_id, error_msg, in_current).
+    """
+    token = (token or "").strip()
+    if not token:
+        return None, "no id provided", False
+
+    # exact match in current
+    for s in current:
+        if s.id == token:
+            return s.id, None, True
+    # prefix in current
+    cur_cands = [s for s in current if s.id.startswith(token)]
+    if len(cur_cands) == 1:
+        return cur_cands[0].id, None, True
+    if len(cur_cands) > 1:
+        return None, f"ambiguous id/prefix '{token}' in current set; refine your prefix", True
+
+    # fall back to global
+    full_id, err = _resolve_unique_id(store, token)
+    if err:
+        return None, err, False
+    return full_id, None, False
+
 # ---------- sub-REPL (find) ----------
 def _apply_find_filters(store: "ScrapStore", tags: List[str], substrs: List[str]) -> List["Scrap"]:
     hits: List[Scrap] = []
@@ -473,10 +486,7 @@ def _apply_find_filters(store: "ScrapStore", tags: List[str], substrs: List[str]
 def find_subrepl(store: "ScrapStore", *, seed_all: bool, seed_text: Optional[str], confirm_deletes: bool) -> None:
     tags: List[str] = []
     substrs: List[str] = []
-    if seed_all and not seed_text:
-        current = list(store.iter_live())
-    else:
-        current = store.search_substring(seed_text) if seed_text else list(store.iter_live())
+    current = list(store.iter_live()) if (seed_all and not seed_text) else (store.search_substring(seed_text) if seed_text else list(store.iter_live()))
 
     def refresh():
         nonlocal current
@@ -485,13 +495,13 @@ def find_subrepl(store: "ScrapStore", *, seed_all: bool, seed_text: Optional[str
     def show(rows_max: int = 50):
         if not current:
             print("(no matches)"); return
-        rows = [( _short_id(s.id), _to_local(s.ts), s.text[:140].replace("\n"," ")) for s in current[-rows_max:]]
+        rows = [(_short_id(s.id), _to_local(s.ts), s.text[:140].replace("\n"," ")) for s in current[-rows_max:]]
         _print_rows(("id","time","text"), [(str(i), t, txt) for i,t,txt in rows])
 
-    picked_id: Optional[str] = None  # `$` variable
-
-    help_string = "find-mode: h | t <tag> | untag <tag> | s <text> | uns <text> | tags | subs | ls | pick [q] | open <id|$> | del <id|$> | clear | json | back"
+    help_string = "find-mode: h | t <tag> | untag <tag> | s <text> | uns <text> | tags | subs | ls | open <id|prefix> | del <id|prefix> | clear | json | back"
     print(help_string)
+    print(f"(filters: tags=[], subs=[], hits={len(current)})")
+
     while True:
         try:
             line = input("find> ").strip()
@@ -509,56 +519,38 @@ def find_subrepl(store: "ScrapStore", *, seed_all: bool, seed_text: Optional[str
             print(help_string)
         elif cmd == "t":
             if not arg: print("usage: t <tag>"); continue
-            tags.append(arg.lstrip("#").lower()); refresh(); print(f"(tags={tags}, subs={substrs}, hits={len(current)})")
+            tags.append(arg.lstrip("#").lower()); refresh(); print(f"(filters: tags={tags}, subs={substrs}, hits={len(current)})")
         elif cmd == "untag":
             if not arg: print("usage: untag <tag>"); continue
             t = arg.lstrip("#").lower()
-            tags[:] = [x for x in tags if x != t]; refresh(); print(f"(tags={tags}, subs={substrs}, hits={len(current)})")
+            tags[:] = [x for x in tags if x != t]; refresh(); print(f"(filters: tags={tags}, subs={substrs}, hits={len(current)})")
         elif cmd == "s":
             if not arg: print("usage: s <text>"); continue
-            substrs.append(arg.lower()); refresh(); print(f"(tags={tags}, subs={substrs}, hits={len(current)})")
+            substrs.append(arg.lower()); refresh(); print(f"(filters: tags={tags}, subs={substrs}, hits={len(current)})")
         elif cmd == "uns":
             if not arg: print("usage: uns <text>"); continue
             d = arg.lower()
-            substrs[:] = [x for x in substrs if x != d]; refresh(); print(f"(tags={tags}, subs={substrs}, hits={len(current)})")
+            substrs[:] = [x for x in substrs if x != d]; refresh(); print(f"(filters: tags={tags}, subs={substrs}, hits={len(current)})")
         elif cmd == "tags":
             print("tags:", tags if tags else "(none)")
         elif cmd == "subs":
             print("subs:", substrs if substrs else "(none)")
         elif cmd == "ls":
             show()
-        elif cmd == "pick":
-            seed = arg or ""
-            cands = current if not seed else [s for s in current if seed.lower() in s.text.lower()]
-            if not cands:
-                print("(no candidates)"); continue
-            items = [(s.id, s.text[:140].replace("\n"," ")) for s in cands]
-            sid = _picker(items, prompt_text="pick> ")
-            if sid is not None:
-                picked_id = sid
-                print(f"picked ${picked_id}")
-        # Interactive find subrepl
         elif cmd == "open":
-            token = arg.strip()
-            if token == "$":
-                if picked_id is None: print("(no $ set)"); continue
-                sid = picked_id
-                one = next((s for s in current if s.id == sid), None)
-            else:
-                full_id, err = _resolve_unique_id(store, token)
-                if err: print(err); continue
-                one = next((s for s in store.iter_live() if s.id == full_id), None)
-            if not one: print("not found in current set"); continue
+            if not arg: print("usage: open <id|prefix>"); continue
+            full_id, err, in_current = _resolve_in_current_then_global(store, current, arg)
+            if err: print(err); continue
+            one = next((s for s in store.iter_live() if s.id == full_id), None)
+            if not one:
+                print("not found"); continue
+            if not in_current:
+                print("(note matched outside current filters)")
             _print_scrap(one)
-        # Interactive find subrepl
         elif cmd == "del":
-            token = arg.strip()
-            if token == "$":
-                if picked_id is None: print("(no $ set)"); continue
-                full_id = picked_id
-            else:
-                full_id, err = _resolve_unique_id(store, token)
-                if err: print(err); continue
+            if not arg: print("usage: del <id|prefix>"); continue
+            full_id, err, in_current = _resolve_in_current_then_global(store, current, arg)
+            if err: print(err); continue
             if confirm_deletes:
                 ans = input(f"delete {full_id}? [y/N] ").strip().lower()
                 if ans not in {"y","yes"}:
@@ -567,59 +559,11 @@ def find_subrepl(store: "ScrapStore", *, seed_all: bool, seed_text: Optional[str
             print("deleted" if ok else "no such live id")
             refresh()
         elif cmd == "clear":
-            tags.clear(); substrs.clear(); refresh(); print("(filters cleared)")
+            tags.clear(); substrs.clear(); refresh(); print(f"(filters: tags=[], subs=[], hits={len(current)})")
         elif cmd == "json":
             print(json.dumps([asdict(s) for s in current], ensure_ascii=False))
         else:
             print("unknown command")
-
-# ---------- Interactive find ----------
-def _picker(items: List[Tuple[str, str]], prompt_text: str = "Select> ") -> Optional[str]:
-    # 1) prompt_toolkit
-    try:
-        from prompt_toolkit import prompt
-        from prompt_toolkit.completion import FuzzyCompleter, WordCompleter
-        display = [f"{title}  [{_short_id(sid)}]" for sid, title in items]
-        comp = FuzzyCompleter(WordCompleter(display, sentence=True))
-        choice = (prompt(prompt_text, completer=comp) or "").strip()
-        if not choice:
-            return None
-        if choice in display:
-            idx = display.index(choice)
-            return items[idx][0]
-        for sid, title in items:
-            if choice.lower() in title.lower():
-                return sid
-    except Exception:
-        pass
-    # 2) fzf
-    if shutil.which("fzf"):
-        lines = [f"{sid}\t{title}" for sid, title in items]
-        try:
-            proc = subprocess.Popen(
-                ["fzf", "--with-nth=2..", "--prompt", prompt_text],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
-            )
-            out, _ = proc.communicate("\n".join(lines))
-            out = (out or "").strip()
-            if not out:
-                return None
-            return out.split("\t", 1)[0]
-        except Exception:
-            pass
-    # 3) numbered fallback
-    for i, (sid, title) in enumerate(items[:50], 1):
-        print(f"{i:2d}. {title}  [{_short_id(sid)}]")
-    try:
-        sel = input("Number (blank to cancel): ").strip()
-        if not sel:
-            return None
-        idx = int(sel) - 1
-        if 0 <= idx < len(items):
-            return items[idx][0]
-    except Exception:
-        return None
-    return None
 
 # ---------- CLI ----------
 def _print_capture_result(scrap: Scrap, id_only: bool) -> None:
@@ -628,11 +572,12 @@ def _print_capture_result(scrap: Scrap, id_only: bool) -> None:
         sys.stderr.write(f"[saved] [{_short_id(scrap.id)}] {_to_local(scrap.ts)} — {scrap.text[:80].replace(os.linesep, ' ')}\n")
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="hdp", description="Drop — tiny personal drop-capture & search")
+    p = argparse.ArgumentParser(prog="drop", description="Drop — tiny personal drop-capture & search")
+    p.add_argument("--version", action="version", version=__version__)
     sub = p.add_subparsers(dest="cmd")
 
     # Default capture via positional at top-level:
-    p.add_argument("text", nargs="?", help="Capture a drop (default action). Same as: hdp add \"...\"")
+    p.add_argument("text", nargs="?", help="Capture a drop (default action). Same as: drop add \"...\"")
     p.add_argument("--id-only", action="store_true", help="On capture, print only the ID (suppress summary)")
 
     # Subcommands
@@ -658,10 +603,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func="tag")
 
-    sp = sub.add_parser("find", help="Find interactively or pick a single ID")
+    sp = sub.add_parser("find", help="Find interactively or list matches")
     sp.add_argument("query", nargs="?", help="Seed text query (optional)")
     sp.add_argument("-i", "--interactive", action="store_true", help="Open interactive find repl")
-    sp.add_argument("-p", "--pick", action="store_true", help="Picker: return a single ID to stdout")
     sp.add_argument("--all", action="store_true", help="Ignore query and start from all live drops")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func="find")
@@ -694,7 +638,7 @@ def repl_main(store: "ScrapStore", *, confirm_deletes: bool) -> None:
 
     while True:
         try:
-            line = input("hdp> ").strip()
+            line = input("drop> ").strip()
         except (EOFError, KeyboardInterrupt):
             print(); break
         if not line:
@@ -706,7 +650,7 @@ def repl_main(store: "ScrapStore", *, confirm_deletes: bool) -> None:
         if cmd in {"q","quit","exit"}:
             break
         elif cmd in {"?","help"}:
-            print("commands: add|a [text] • e|edit [seed] • ls [N] • search <text> • tag <tag> • open <id> • del <id> • export [--days-ago N] [--outflow NAME] • find [--all] [seed] • help • quit")
+            print("commands: add|a [text] • e|edit [seed] • ls [N] • search <text> • tag <tag> • open <id|prefix> • del <id|prefix> • export [--days-ago N] [--outflow NAME] • find [--all] [seed] • help • quit")
         elif cmd in {"e","edit"}:
             seed = arg if arg else None
             text, canceled = capture_via_editor(seed, keep_temp=False)
@@ -744,7 +688,6 @@ def repl_main(store: "ScrapStore", *, confirm_deletes: bool) -> None:
             hits = store.search_tag(arg)
             if not hits: print("(no matches)"); continue
             for s in hits: _print_scrap(s)
-        # main repl
         elif cmd == "open":
             if not arg: print("usage: open <id|prefix>"); continue
             full_id, err = _resolve_unique_id(store, arg)
@@ -752,7 +695,6 @@ def repl_main(store: "ScrapStore", *, confirm_deletes: bool) -> None:
             one = next((s for s in store.iter_live() if s.id == full_id), None)
             if not one: print("not found"); continue
             _print_scrap(one)
-        #main repl
         elif cmd == "del":
             if not arg: print("usage: del <id|prefix>"); continue
             full_id, err = _resolve_unique_id(store, arg)
@@ -764,10 +706,6 @@ def repl_main(store: "ScrapStore", *, confirm_deletes: bool) -> None:
             ok = store.delete(full_id)
             print("deleted" if ok else "no such live id")
         elif cmd == "export":
-            # Allow: export [--days-ago N] [--outflow NAME]
-            # If outflows exist and no --path given, export all configured outflows (or the named one).
-            # Else fallback to legacy single export path (or overridden --path).
-            # parse tiny inline flags (legacy REPL path)
             days_ago, outflow_name, out_path_override = 0, None, None
             if arg:
                 toks = arg.split()
@@ -802,14 +740,12 @@ def _do_export(store: ScrapStore, *, days_ago: int, outflow_name: Optional[str],
     target_day = (date.today() - timedelta(days=max(0, days_ago))).isoformat()
 
     if outflows and not path_override:
-        # Export to all or to one named outflow
         targets = outflows
         if outflow_name:
             targets = [of for of in outflows if of.name == outflow_name]
             if not targets:
                 print(f"No such outflow: {outflow_name}")
                 return
-        total_written = 0
         for of in targets:
             of.export_path.mkdir(parents=True, exist_ok=True)
             path = export_daily_markdown(
@@ -820,13 +756,11 @@ def _do_export(store: ScrapStore, *, days_ago: int, outflow_name: Optional[str],
                 transform_fn=lambda s, of=of: _render_text_for_outflow(s, of),
             )
             count = sum(1 for s in store.iter_live() if _local_date_str(s.ts) == target_day and _matches_outflow(s, of))
-            total_written += count
             print(f"[{of.name}] Exported {count} drops to {path}")
         if len(targets) > 1:
             print(f"Done. {len(targets)} outflows exported.")
         return
 
-    # Fallback: legacy single export path (or override path)
     out_dir = path_override if path_override else EXPORT_DIR_DEFAULT
     out_path = export_daily_markdown(store, out_dir, days_ago=max(0, days_ago))
     count = sum(1 for s in store.iter_live() if _local_date_str(s.ts) == target_day)
@@ -910,19 +844,8 @@ def main() -> None:
 
         if cmd == "find":
             seed_all = args.all or not args.query
-            if args.pick:
-                cands = list(store.iter_live()) if seed_all else store.search_substring(args.query)
-                if not cands:
-                    sys.exit(1)
-                items = [(s.id, s.text[:140].replace("\n"," ")) for s in cands]
-                sid = _picker(items)
-                if sid is not None:
-                    print(sid)
-                    sys.exit(0)
-                else:
-                    sys.exit(2)
             if args.interactive:
-                find_subrepl(store, seed_all=True, seed_text=None, confirm_deletes=True)
+                find_subrepl(store, seed_all=seed_all, seed_text=(args.query or None), confirm_deletes=True)
                 return
             hits = list(store.iter_live()) if seed_all else store.search_substring(args.query)
             if args.json:
